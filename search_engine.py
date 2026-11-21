@@ -3,7 +3,7 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "3D Model Search Engine"
-# description = "Search 3D models from inside OrcaSlicer and load them straight onto the plate. Printables needs no account. MakerWorld signs in from the plugin’s own window with a six-digit code Bambu emails you, and Makeronline with the Anycubic account you already have — whichever each portal actually offers, asked for in the plugin window and never in a browser. Credentials are sent only to the portal they belong to; just the token it returns is kept, in OrcaSlicer’s plugin config and nowhere else. The licence is always shown before the download, and no external browser is ever opened."
+# description = "Search 3D models from inside OrcaSlicer and load them straight onto the plate. Printables needs no account. Snapmaker Space signs in from the plugin’s own window with a code Snapmaker emails you, and Makeronline with the Anycubic account you already have; MakerWorld is search-only, because Bambu lets only its own apps download — whichever each portal actually offers, asked for in the plugin window and never in a browser. Credentials are sent only to the portal they belong to; just the token it returns is kept, in OrcaSlicer’s plugin config and nowhere else. The licence is always shown before the download, and no external browser is ever opened."
 # author = "eveliodrd"
 # version = "0.5.1"
 # ///
@@ -1381,26 +1381,37 @@ _SEARCHERS = {
 # Keyed on the "platform" field of a result. Printables serves files to anyone;
 # MakerWorld serves them to an account. Nexprint (401) and Makeronline (403)
 # still have no route the plugin can take.
+# MakerWorld is search-only: with a valid Bambu token (user-service/my/profile
+# answers 200) the old iot-service profile route answers 400 "check specified
+# resource exist", and design-service/instance/<id>/f3mf?type=download answers
+# 403 "The client does not have access rights to the content" on both
+# api.bambulab.com and makerworld.com, bearer or cookie alike. Bambu serves
+# files only to its own clients, and posing as one is not on the table.
+# Checked 2026-11-20.
 _FILE_RESOLVERS = {
     "Printables": PrintablesSearcher.get_files,
-    "MakerWorld": MakerWorldSearcher.get_files,
     "Makeronline": MakeronlineSearcher.get_files,
     "Snapmaker Space": SnapmakerSpaceSearcher.get_files,
+}
+
+# Why a searchable platform cannot be imported, shown on its results.
+_NO_IMPORT_NOTES = {
+    "MakerWorld": "Bambu Lab only lets its own apps download MakerWorld files "
+                  "(the MakerWorld site, Bambu Studio, Bambu Handy). Download it "
+                  "there, then open the file in OrcaSlicer.",
 }
 
 # Platforms that serve files only to an account, and the config key holding the
 # user's own token for each. Without the token the platform stays searchable but
 # is not offered for import, so the guard rail holds: everything the panel says
 # it can import, it can import.
-_TOKEN_KEYS = {"MakerWorld": "makerworld_token",
-               "Makeronline": "makeronline_token",
+_TOKEN_KEYS = {"Makeronline": "makeronline_token",
                "Snapmaker Space": "snapmaker_token"}
 
 # Platforms whose file list carries no URL, because minting one costs an
 # authenticated call that expires in minutes. Called once per picked file, at
 # download time. A platform absent here has usable URLs already.
-_URL_MINTERS = {"MakerWorld": MakerWorldSearcher.mint_url,
-                "Makeronline": MakeronlineSearcher.mint_url}
+_URL_MINTERS = {"Makeronline": MakeronlineSearcher.mint_url}
 
 # Platforms that can be signed into from inside the plugin window:
 # (request a code, exchange it for a token). A None first element means the
@@ -1408,9 +1419,7 @@ _URL_MINTERS = {"MakerWorld": MakerWorldSearcher.mint_url,
 # instead - Anycubic's SSO answers enableCodeSignin:false, and pretending
 # otherwise would leave the user waiting for a mail that never arrives.
 # A platform absent here can still be connected by pasting a token.
-_AUTH = {"MakerWorld": (MakerWorldSearcher.send_code,
-                        MakerWorldSearcher.login_with_code),
-         "Makeronline": (None, MakeronlineSearcher.sign_in),
+_AUTH = {"Makeronline": (None, MakeronlineSearcher.sign_in),
          "Snapmaker Space": (SnapmakerSpaceSearcher.send_code,
                              SnapmakerSpaceSearcher.login_with_code)}
 
@@ -1434,7 +1443,8 @@ def _accounts(tokens):
         else:
             state = "unavailable"   # nothing the plugin can fetch, with or without one
         rows.append({"platform": name, "state": state, "key": key or "",
-                     "help": _TOKEN_HELP.get(name, ""),
+                     "help": _TOKEN_HELP.get(name, "") if key else "",
+                     "note": _NO_IMPORT_NOTES.get(name, ""),
                      "can_sign_in": name in _AUTH,
                      "sign_in_mode": ("code" if (_AUTH.get(name) or (None,))[0]
                                       else "password") if name in _AUTH else ""})
@@ -1720,7 +1730,7 @@ PAGE = r"""<!DOCTYPE html>
 
   // Filled from the Accounts message, so the help text has one home (Python's
   // _TOKEN_HELP) instead of a copy here that can drift from it.
-  var TOKEN_HELP = {}, ACCOUNTS = [];
+  var TOKEN_HELP = {}, NO_IMPORT = {}, ACCOUNTS = [];
 
   function showAccounts() {
     var box = $("acct-rows"), html = "";
@@ -1757,7 +1767,7 @@ PAGE = r"""<!DOCTYPE html>
              +  '<button onclick="saveAcct(' + i + ')">Save</button></div>';
         if (a.can_sign_in) html += '</details>';
       } else if (a.state === "unavailable") {
-        html += '<p>Searchable, but it serves no file the plugin can fetch yet.</p>';
+        html += '<p>' + esc(a.note || "Searchable, but it serves no file the plugin can fetch yet.") + '</p>';
       } else {
         html += '<p>Files download without signing in to anything.</p>';
       }
@@ -1824,8 +1834,10 @@ PAGE = r"""<!DOCTYPE html>
     }
     // Only MakerWorld has a token route today; the others are gated because no
     // resolver exists for them at all, and a recipe would be a lie there.
-    gate.textContent = model.platform + " serves files only to an account."
-      + (TOKEN_HELP[model.platform] || " The plugin cannot fetch its files yet.");
+    gate.textContent = NO_IMPORT[model.platform]
+      ? NO_IMPORT[model.platform] + (model.url ? " Model page: " + model.url : "")
+      : model.platform + " serves files only to an account."
+        + (TOKEN_HELP[model.platform] || " The plugin cannot fetch its files yet.");
     gate.classList.add("active");
     // A disabled button under an instruction is a dead end: the user is told what
     // to do and given nothing to do it with. The field is the action.
@@ -1989,6 +2001,8 @@ PAGE = r"""<!DOCTYPE html>
       ACCOUNTS = msg.rows || [];
       TOKEN_HELP = {};
       ACCOUNTS.forEach(function (a) { if (a.help) TOKEN_HELP[a.platform] = " " + a.help; });
+      NO_IMPORT = {};
+      ACCOUNTS.forEach(function (a) { if (a.note) NO_IMPORT[a.platform] = a.note; });
       // First run: show the setup instead of letting the user meet the gate
       // later, on a model they already decided they wanted.
       if (msg.first_run) showAccounts();

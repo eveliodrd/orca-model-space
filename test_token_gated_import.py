@@ -2,7 +2,8 @@
 """A gated platform is importable exactly when the user's token is present.
 
 Covers the guard rail (nothing is offered for import that cannot be fetched)
-and the MakerWorld two-hop resolve, with no network and no `orca` host.
+and the Makeronline sign-in, with no network and no `orca` host. MakerWorld is
+search-only: Bambu serves its files to Bambu's own apps alone.
 """
 import json
 import os
@@ -41,12 +42,14 @@ import search_engine as script  # noqa: E402
 
 def test_importable_follows_the_token():
     assert script._importable("Printables", {}) is True, "Printables needs no token"
-    assert script._importable("MakerWorld", {}) is False, "no token, not offered"
-    assert script._importable("MakerWorld", {"makerworld_token": "   "}) is False, \
+    assert script._importable("Makeronline", {}) is False, "no token, not offered"
+    assert script._importable("Makeronline", {"makeronline_token": "   "}) is False, \
         "whitespace is not a token"
-    assert script._importable("MakerWorld", {"makerworld_token": "abc"}) is True
-    assert script._importable("Nexprint", {"makerworld_token": "abc"}) is False, \
+    assert script._importable("Makeronline", {"makeronline_token": "abc"}) is True
+    assert script._importable("Nexprint", {"makeronline_token": "abc"}) is False, \
         "a token for one platform must not unlock another"
+    assert script._importable("MakerWorld", {"makerworld_token": "abc"}) is False, \
+        "MakerWorld refuses third-party downloads, token or not"
 
 
 def test_makerworld_resolver_needs_a_token():
@@ -105,17 +108,17 @@ def test_saving_a_token_merges_and_never_echoes_it():
 
     posted = []
     cap._post = posted.append
-    cap._save_token({"platform": "MakerWorld", "token": "  SECRET  "})
+    cap._save_token({"platform": "Makeronline", "token": "  SECRET  "})
     # A successful save is followed by a refreshed Accounts list, so pick the
     # reply by its action rather than by position.
     saved = [m for m in posted if m["action"] == "token_saved"][-1]
 
     stored = json.loads(cap.get_config())
-    assert stored["makerworld_token"] == "SECRET", "the token is stored, trimmed"
+    assert stored["makeronline_token"] == "SECRET", "the token is stored, trimmed"
     assert stored["other_token"] == "keep-me", "a merge, not a replace"
-    assert saved["ok"] is True and saved["platform"] == "MakerWorld"
+    assert saved["ok"] is True and saved["platform"] == "Makeronline"
     assert "SECRET" not in json.dumps(posted), "no reply may carry the token back"
-    assert script._importable("MakerWorld", stored) is True, "import is now offered"
+    assert script._importable("Makeronline", stored) is True, "import is now offered"
 
     cap._save_token({"platform": "Nexprint", "token": "x"})
     assert posted[-1]["ok"] is False, "a platform with no token key is refused"
@@ -127,13 +130,16 @@ def test_accounts_rows_match_what_is_importable():
     rows = {r["platform"]: r for r in script._accounts({})}
 
     assert rows["Printables"]["state"] == "open", "no account needed"
-    assert rows["MakerWorld"]["state"] == "needs_token"
-    assert rows["MakerWorld"]["help"], "a gated platform must say how to connect"
+    assert rows["Makeronline"]["state"] == "needs_token"
+    assert rows["Makeronline"]["help"], "a gated platform must say how to connect"
+    assert rows["MakerWorld"]["state"] == "unavailable", "search-only"
+    assert rows["MakerWorld"]["note"], "a search-only platform must say why"
+    assert not rows["MakerWorld"]["help"], "and must not ask for a token that cannot help"
     assert rows["Nexprint"]["state"] == "unavailable", "no resolver, so no token helps"
     assert rows["GrabCAD"]["state"] == "unavailable"
 
-    connected = {r["platform"]: r for r in script._accounts({"makerworld_token": "T"})}
-    assert connected["MakerWorld"]["state"] == "connected"
+    connected = {r["platform"]: r for r in script._accounts({"makeronline_token": "T"})}
+    assert connected["Makeronline"]["state"] == "connected"
     # Every platform the panel can search has a row, or the screen hides one.
     assert set(rows) == {a.PLATFORM for a in script._SEARCHERS.values()}
 
@@ -154,7 +160,7 @@ def test_signing_in_asks_for_a_code_and_never_a_password():
         raise AssertionError("unexpected call: " + url)
 
     fake.post = post
-    sys.modules["requests"] = fake
+    script._http = fake
 
     note = script.MakerWorldSearcher.send_code("someone@example.com")
     # Measured against the live API: without this exact type the request is
@@ -175,7 +181,7 @@ def test_signing_in_asks_for_a_code_and_never_a_password():
         raise AssertionError("a login with no token must raise")
 
 
-def test_a_completed_sign_in_stores_the_token():
+def test_makerworld_cannot_be_signed_into():
     cap = script.SearchEngineScript()
     cap._stored = "{}"
     posted = []
@@ -183,8 +189,8 @@ def test_a_completed_sign_in_stores_the_token():
     cap._do_auth("sign_in", {"platform": "MakerWorld",
                              "email": "someone@example.com", "code": "123456"})
 
-    assert json.loads(cap.get_config())["makerworld_token"] == "TOK"
-    assert [m for m in posted if m["action"] == "token_saved" and m["ok"]]
+    assert json.loads(cap.get_config()) == {}, "a login that cannot help stores nothing"
+    assert posted[-1]["ok"] is False
 
     cap._do_auth("sign_in", {"platform": "Printables"})
     assert posted[-1] == {"action": "auth", "ok": False, "platform": "Printables",
@@ -224,7 +230,7 @@ def test_makeronline_signs_in_with_a_password_and_keeps_only_the_token():
 
     fake.post = post
     fake.get = get
-    sys.modules["requests"] = fake
+    script._http = fake
 
     token = script.MakeronlineSearcher.sign_in("someone@example.com", "hunter2")
     assert token == "JWT", "the stored credential is the site token, not the password"
@@ -269,7 +275,7 @@ def test_makeronline_signs_in_with_a_password_and_keeps_only_the_token():
 
     rows = {r["platform"]: r for r in script._accounts({})}
     assert rows["Makeronline"]["sign_in_mode"] == "password"
-    assert rows["MakerWorld"]["sign_in_mode"] == "code"
+    assert rows["MakerWorld"]["sign_in_mode"] == ""
 
     url = script.MakeronlineSearcher.mint_url(
         {"_key": "b48e37341606360c43d2807eb07dc2f0", "_mold_id": "151818",
@@ -312,7 +318,7 @@ def _install_fake_requests():
         raise AssertionError("unexpected call: " + url)
 
     fake.get = get
-    sys.modules["requests"] = fake
+    script._http = fake
     return calls
 
 
@@ -322,7 +328,7 @@ if __name__ == "__main__":
     test_saving_a_token_merges_and_never_echoes_it()
     test_accounts_rows_match_what_is_importable()
     test_signing_in_asks_for_a_code_and_never_a_password()
-    test_a_completed_sign_in_stores_the_token()
+    test_makerworld_cannot_be_signed_into()
     test_makeronline_signs_in_with_a_password_and_keeps_only_the_token()
     test_makeronline_resolver_needs_a_token()
     calls = _install_fake_requests()
