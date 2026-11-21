@@ -1,0 +1,300 @@
+# OrcaSlicer Model Search Plugin — Status
+
+**Updated**: 2026-11-20 (v0.5.1)
+**Repository**: `https://github.com/eveliodrd/orca-model-space`
+**Installed plugin**: `<datadir>/orca_plugins/search_engine/search_engine.py`
+(`<datadir>` is `%APPDATA%\OrcaSlicer` on Windows)
+
+---
+
+## What works (verified in the running app, 2026-08-09)
+
+- **Search**: Printables only, 30 results for "benchy". Public API, no auth.
+- **Thumbnails**: load fine (cross-origin images from a `file://` origin are not blocked).
+- **Card clicks**: delegated listener on `#results`, detail panel opens as a fixed overlay.
+- **Import into OrcaSlicer**: Printables model → STL downloaded → **lands in Prepare**.
+  Verified: `3dbenchy.stl`, 60.001 × 31.004 × 48 mm, 225154 triangles, on the plate.
+## v0.2.0 — the two guard rails
+
+1. **No external browser, ever.** `xdg-open` / `open` / `os.startfile` are gone, the
+   "Open in browser" button is gone, and nothing in the panel is an `<a href>`: URLs are
+   rendered as text so they can neither navigate the webview nor reach a browser.
+2. **Everything offered lands in Prepare.** `_do_search` skips any adapter whose
+   `PLATFORM` has no `_FILE_RESOLVERS` entry, so a result the plugin cannot fetch is never
+   shown. That is why only Printables is listed.
+
+Nexprint and Makeronline stay in the source, searchable but not importable. MakerWorld
+became importable on 2026-09-20 once the right endpoint was found — the earlier "403, please
+log in" was the *wrong endpoint*, not a wall. Re-checked 2026-09-06 for the other two:
+
+| Platform | Search API | File download |
+|----------|-----------|---------------|
+| **MakerWorld (Bambu)** | `api.bambulab.com/v1/search-service/select/design2` | ✅ **with the user's own Bambu Cloud token** (see below) |
+| Nexprint (Elegoo) | `nexprint.com/gateway/api/v1/model-library-server/model-base-info/search` | ❌ detail returns `file_url: ""` without a session |
+| Makeronline (Anycubic) | `POST makeronline.com/api/search/model` | ❌ `files[].url` → 403 AccessDenied (private S3) |
+| **Printables (Prusa)** | `searchPrints2` GraphQL query | ✅ **public, no auth** |
+
+Disabled: Thingiverse (`/download:ID` → 403 robots), GrabCAD (API retired).
+
+### How the Printables download works
+`api.printables.com/graphql/` is open (introspection off, queries fine) and the site's
+own download call needs no authentication. Two requests per print: list the files,
+then ask for each file's real URL.
+
+```
+{print(id:1041594){stls{id name}}}
+mutation { getDownloadLink(id: <stlId>, printId: <printId>,
+                           fileType: stl, source: model_detail) { ok output { link } } }
+```
+
+**Do not derive the URL from `filePreviewPath`.** That was the old recipe — strip the
+basename off the preview path, append the file name — and it only holds for prints
+stored the old way (`media/prints/<id>/stls/<n>_<uuid>/<name>_preview.png`). Newer
+prints keep previews in their own subfolder (`media/prints/<uuid>/previews/<sha>.png`),
+where the derived URL 404s and Import fails with nothing on the plate. 3dbenchy (3161)
+is an old-layout print, which is why every test passed while real models did not work.
+
+Verified 2026-09-06 against both layouts: Flexi Capy Snek (1041594), 14 files, first is
+HTTP 200 `model/stl` 4307484 bytes; 3D Benchy (3161) still HTTP 200, 11285384 bytes.
+
+### How the MakerWorld download works
+Three calls, the first two anonymous:
+
+```
+GET api.bambulab.com/v1/design-service/design/<designId>            -> modelId   (alphanumeric)
+GET api.bambulab.com/v1/design-service/design/<designId>/instances  -> hits[].profileId
+GET api.bambulab.com/v1/iot-service/api/user/profile/<profileId>?model_id=<modelId>
+    Authorization: Bearer <Bambu Cloud token>                       -> {"url": signed CDN URL}
+```
+
+`modelId` is **not** the integer in the `/models/<N>` URL — that is the designId, and the
+download rejects it. The signed URL lives about five minutes.
+
+**The token is the user's own, and the plugin never goes looking for one.** It is read from
+the capability's config, which the *host* stores (`<datadir>/orca_plugins/config.json`) and
+hands back through `self.get_config()` — a JSON string, so `json.loads` it. `get_config()`
+only works on the instance the host built; a hand-constructed one raises "only available on a
+capability loaded by the plugin host", which is what the debug autorun hits. `get_default_config()`
+seeds the Config tab's JSON editor with `{"makerworld_token": ""}` so the key names itself.
+
+**Signing in from the window (the normal route since 2026-10-18).** Bambu has a passwordless
+code login, so the plugin never asks for a password:
+
+```
+POST api.bambulab.com/v1/user-service/user/sendemail/code  {"email": e, "type": "codeLogin"}  -> 200
+POST api.bambulab.com/v1/user-service/user/login           {"account": e, "code": "123456"}   -> {"accessToken": ...}
+```
+
+`type: "codeLogin"` is mandatory and measured: without it the reply is `{"code":1,"error":"This
+account is not registered."}` even for a real address, and a wrong type gives `{"code":2}`.
+sendemail/code answers 200 for an unknown address too (anti-enumeration), so the UI must not
+read 200 as "that account exists". A login that returns 200 with no `accessToken` means another
+factor is required; `loginType` names it.
+
+**Where the user gets the token by hand** (the fallback, behind "Or paste a token instead") (the gap that made MakerWorld unusable in practice: nothing
+anywhere said this). The bearer is the `accessToken` that `POST
+api.bambulab.com/v1/user-service/user/login` returns at the top level, and the site attaches it
+to every download it performs. So the instruction the plugin now gives — sign in at
+makerworld.com, F12 > Network, click Download on any model, copy the text after `Bearer ` from
+that request's `Authorization` header — cannot go stale: it reads the header off a real request
+instead of naming a cookie or storage key the site is free to rename.
+
+Verified live 2026-10-18: calls 1 and 2 still return 200 anonymously (design 1400373 ->
+`modelId` `US300293b2858c3b`, 7 profiles); call 3 returns **401 `{"code":4,"error":"Please
+login."}`** with no token, with a bogus bearer and with the query param omitted. The gate is
+authentication and nothing else — not geo, not Cloudflare, not a dead route. `designExtension.
+model_files` is empty on that design, so there is no anonymous file route to fall back to. An
+authorized **200 is still unverified** — it needs a real Bambu account.
+
+Reading OrcaSlicer's *own* Bambu login is not an option and should not be attempted:
+`PluginAuditManager::default_denied_filenames()` blocks `OrcaSlicer.conf/.ini` and
+`orca_refresh_token.sec` to plugins, and the comment in `is_denied_filename` names symlink and
+subprocess laundering as evasion. Bambu has no third-party OAuth either (password plus an
+emailed 6-digit code), so a pasted token is both the only route and the most defensible one.
+
+**Listing mints nothing.** A design can carry dozens of profiles — Benchy Bambu PLA Basic has
+91, measured 2026-09-20 — so `get_files` returns names with an empty `url`, and `mint_url`
+runs only for the entries the user ticked. The picker also stops pre-ticking above 8 files,
+because 91 pre-ticked plates turn one press into 91 downloads.
+
+### How the Makeronline download works
+Verified end to end in the running app, 2026-10-18.
+
+Makeronline runs no login of its own: it authenticates through Anycubic's **Casdoor** SSO at
+`cas.anycubic.com`. Everything needed is published in the site's own bundle
+(`www.makeronline.com/_nuxt/app.*.js`): client id `69ce24b6eaf78e597ac0`, application
+`ac_maker_online`, organization `anycubic`.
+
+```
+GET  cas.anycubic.com/api/get-app-login?type=code&clientId=..&responseType=code
+                                       &redirectUri=https://www.makeronline.com&scope=read&state=x
+        -> the application config.  type=code is MANDATORY: without it data is null.
+           It answers enablePassword:true, enableCodeSignin:FALSE.
+POST cas.anycubic.com/api/login?clientId=..&responseType=code&redirectUri=..&scope=read
+                               &state=ac_maker_online
+        {application, organization, username, password, remember, isRecMarEmail, type:"code"}
+        -> {"status":"ok","data":"<oauth code>"}      ("status":"error" carries Casdoor's own msg)
+GET  www.makeronline.com/api/login?code=<code>&state=ac_maker_online
+        -> {"code":0,"data":{"access_token":..,"expire_time":..}}
+```
+
+**There is no e-mail code here**, unlike Bambu: `enableCodeSignin` is false, so the Accounts
+row asks for the Anycubic password. It goes to Anycubic and nowhere else, is never stored, and
+the field is cleared as soon as the reply lands. Only `access_token` is kept.
+
+**The exchange route is `/api/login`, NOT `api/v2/auth/login`.** The bundle defines the latter
+and nothing serves it: every request shape answers `{"code":1,"message":"Server internal
+error"}` — byte for byte what unknown routes answer, which cost a release to learn. The real
+one answers `invalid_grant` for a bad code and `invalid_request` with no parameters. A Casdoor
+code is single-use and expires in moments, so `invalid_grant` is translated for the user.
+
+Files and minting:
+
+```
+GET  /api/mold/detail?id=<mold_id>   anonymous; the parameter is `id` ("mold_id" answers
+                                     "The id field is required"). files[] = {file_id, file_name,
+                                     file_size, key, parse_type}.  Model URLs end /<mold_id>.html
+POST /api/file/download              Authorization: <access_token>  RAW, no "Bearer" — the site's
+                                     axios interceptor sets `Authorization = token` verbatim
+        {key, file_type:1, mold_id:<int>, is_batch_down:0}
+        -> {"code":0,"data":"<signed S3 url>"}      code 1003 = its risk check wants a captcha
+```
+
+`file_type` 2 is a print profile (`print_profile_id`), 3 carries both. Listing stays anonymous
+and mints nothing, for the same reason as MakerWorld.
+
+### How the file reaches Prepare (all three OSes)
+The plugin host API is **read-only** — `orca.host.model/mesh/presets/slicing` only
+inspect; there is no import/add-object binding. But every running instance listens on
+the session bus for the message a second launch would send
+(`slic3r/GUI/InstanceCheck.cpp`):
+
+- name/interface: `com.orcaslicer.OrcaSlicer.InstanceCheck.Object<instance_hash>`
+- object: `/com/orcaslicer/OrcaSlicer/InstanceCheck/Object<instance_hash>`
+- method: `AnotherInstance(string)`
+
+The string is an argv list in `unescape_strings_cstyle` format — **semicolon-separated,
+quoted** (`"orca-slicer";"/path/file.stl"`), *not* space-separated. `argv[0]` is skipped
+as the executable path. File paths there reach `EVT_LOAD_MODEL_OTHER_INSTANCE`, i.e. the
+plater, and Orca switches to Prepare on its own. `_load_in_orca_dbus()` discovers the
+instance hash from `ListNames`, so it needs no configuration.
+
+**D-Bus is Linux-only**, so `_load_in_orca()` dispatches on the OS:
+
+| OS | Transport | Receiver |
+|----|-----------|----------|
+| Linux | `dbus-send` `AnotherInstance` | `InstanceCheck.cpp` D-Bus listener |
+| Windows | `SendMessageW(hwnd, WM_COPYDATA, …)`, `dwData = 1` | `GUI_App.cpp:675` `MSWRegisterMessageHandler` → `handle_message()` |
+| macOS | `open -a <bundle> <file>` | `GUI_App::MacOpenFiles` (`GUI_App.cpp:9002`) |
+
+On Windows the plugin runs **inside** the target process, so the main frame is found by
+`EnumWindows` filtered on class `wxWindowNR` + both `Instance_Hash_*` props + our own PID —
+no instance hash needs computing. On macOS, `open -a` delivers an "open documents" Apple
+Event to the running instance; `MacOpenFiles` only spawns a second slicer for `.3mf`, and
+models arrive as `.stl`/`.step`.
+
+**Rejected: relaunching with `--single-instance`.** It looks like the obvious portable
+answer — `process_command_line()` does set `should_send = true` on that token — but the
+`single_instance` CLI option is commented out in `PrintConfig.cpp:12394`, so `setup()`
+rejects the argument and the process dies with `setup params error`, exit 254. Measured on
+the belt-2026-08 build, 2026-09-06. Without the flag the hand-off depends on the user's
+`single_instance` preference, which is `false` by default.
+
+**Only the Linux transport has been exercised on real hardware.** Windows and macOS are
+derived from the receiving code, not observed.
+
+---
+
+## Corrections to the previous handoff
+
+The old "OrcaSlicer webview constraints" list was **wrong on nearly every point**. It was
+built by inference during debugging, never verified. Reproduced against the same
+`libwebkit2gtk-4.1` (2.52.3) Orca links, with the same launcher env, and confirmed inside
+the running app:
+
+| Old claim | Reality |
+|-----------|---------|
+| Dynamic HTML with inline `onclick` is stripped | False — fires normally |
+| `addEventListener` on dynamic elements doesn't work | False — works |
+| Webview blocks cross-origin images | False — thumbnails load |
+| `webbrowser.open()` / no external browser | False — `xdg-open` works, lands in the user's Chrome session |
+| "Card clicks do nothing" | The handler *did* fire; the detail panel opened ~2300 px below the fold, under 10 rows of cards. Nobody scrolled. Now a fixed overlay. |
+| Only fix is 40 static template cards | That hack also silently capped results at 40 of 126. Removed. |
+
+`ORCABELT_DISABLE_WEBVIEW=1` in the launcher is genuinely inert (not referenced anywhere
+in the source).
+
+**Lesson**: the webview had no error channel, so every diagnosis was a guess. It now pipes
+`window.onerror` and `jlog()` through `orca.postMessage` → Python `sys.stderr`, which the
+host tees to `<datadir>/log/python_*.log`. Read that file before theorising.
+
+---
+
+## Launching the plugin
+
+The Home page side panel now has a **Plugins** entry (between Recent and OrcaCloud) that
+opens the same dialog as Tools ▸ Plugins. Three files in the fork, no new assets:
+
+- `resources/web/homepage/index.html` — the `BtnItem` + inline puzzle SVG (`currentColor`, so it follows the theme)
+- `resources/web/homepage/js/home.js` — `OnClickPlugins()` → `SendWXMessage({command:"homepage_plugins"})`
+- `src/slic3r/GUI/GUI_App.cpp` — `homepage_plugins` → `CallAfter([this]{ open_plugins_dialog(); })`
+
+The label is plain text, not `trans`/`tid`, because a new tid would need a localization entry.
+
+## Testing
+
+**Stub tests** — `test_page_tab.py` and `test_file_picker.py` run with a stub `orca`
+module and no network, using OrcaSlicer's bundled Python:
+
+```powershell
+& "C:\Program Files\OrcaSlicer\python\python.exe" test_page_tab.py
+```
+
+**In-app autorun** — `SEARCH_ENGINE_AUTORUN=1` makes the plugin open its own window,
+search "benchy" and click the first importable card, so the probes run with no mouse.
+Set it, start OrcaSlicer, then read the newest `<datadir>/log/python_*.log`.
+
+---
+
+## Next
+
+0. **Releasing is automated once the repo is connected.** Connect this repository
+   to an Orca Cloud listing under Edit plugin ▸ GitHub publishing, and
+   `.github/workflows/publish-orcacloud.yml` publishes on every GitHub release.
+   Documented at `https://cloud.orcaslicer.com/wiki/#publish-from-github`.
+
+   To ship a version: bump the PEP 723 `version`, push, then create a release
+   whose tag is `v<that same version>` and higher than the live one. The tag
+   becomes the plugin version and the release notes become the changelog; the
+   workflow fans the single `search_engine.py` out to the seven target-suffixed
+   names the hub keeps one entry per, and refuses to run if the tag and the
+   header disagree. Authentication is GitHub's OIDC token, `audience=orcacloud`
+   — there is no secret in the repo, and connecting gives Orca Cloud no access
+   to it. A `401` means the repository is not connected to exactly one of your
+   plugins; re-running a successful release is safe and fails harmlessly.
+
+   If uploading by hand through the web form instead: a release is created from
+   the VERSION field, so changing the files without bumping the version fails
+   silently, and the form ignores a file whose name matches one already attached.
+
+1. **More importable platforms** — MakerWorld is done (v0.3.0). Nexprint and Makeronline
+   still gate files and have no known token route; both are searchable, and their results say
+   so on the panel rather than offering a dead button. Before assuming either is walled, check
+   whether the wall is really the wrong endpoint — that is all MakerWorld's 403 ever was.
+
+   **Not verified: an authorized 200 from the MakerWorld download.** Everything up to it is
+   (91 profiles listed live, an invalid token gets the intended 401 message), but the final
+   fetch needs a real Bambu account.
+2. **Multi-file prints — done.** A print with more than one file now stops at a picker:
+   the resolver's list comes back to the panel as a checkbox per file (All / None
+   buttons, all ticked), and only the ticked ones are downloaded. A single-file print
+   still imports on one press. `test_file_picker.py` covers the three cases with a stub
+   `orca` module and no network.
+
+   Note what a big print costs regardless: Flexi Capy Snek (1041594) is 14 files, and
+   Orca then raises its own modal per part that is too small to be millimetres (the
+   Teeth-Brim / Teeth-Joiner pieces) plus a "multiple parts detected" prompt. Ticking
+   everything means clicking through all of them.
+3. **`orcaslicer://` deep links** — `GUI_App::start_download()` exists and the
+   `AnotherInstance` payload accepts `orcaslicer://open?file=<url>`, letting Orca do the
+   download itself. Unused; the plugin fetches with `requests` for control over headers.
