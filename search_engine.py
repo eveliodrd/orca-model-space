@@ -3,7 +3,7 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "3D Model Search Engine"
-# description = "Search 3D models from inside OrcaSlicer and load them straight onto the plate. Printables needs no account. Snapmaker Space signs in from the plugin’s own window with a code Snapmaker emails you, and Makeronline with the Anycubic account you already have; MakerWorld is search-only, because Bambu lets only its own apps download — whichever each portal actually offers, asked for in the plugin window and never in a browser. Credentials are sent only to the portal they belong to; just the token it returns is kept, in OrcaSlicer’s plugin config and nowhere else. The licence is always shown before the download, and no external browser is ever opened."
+# description = "Search 3D models from inside OrcaSlicer and load them straight onto the plate. Printables needs no account. MakerWorld signs in from the plugin’s own window with a six-digit code Bambu emails you, and Makeronline with the Anycubic account you already have — whichever each portal actually offers, asked for in the plugin window and never in a browser. Credentials are sent only to the portal they belong to; just the token it returns is kept, in OrcaSlicer’s plugin config and nowhere else. The licence is always shown before the download, and no external browser is ever opened."
 # author = "eveliodrd"
 # version = "0.5.1"
 # ///
@@ -947,12 +947,16 @@ class MakerWorldSearcher:
     BASE = "https://makerworld.com"
     DESIGN_URL = "https://api.bambulab.com/v1/design-service/design/%s"
     INSTANCES_URL = "https://api.bambulab.com/v1/design-service/design/%s/instances"
-    # The download the site performs for itself, on the api.bambulab.com backend
-    # rather than on Cloudflare-protected makerworld.com. It takes the same
-    # bearer the user already signs in with and mints the signed CDN URL the
-    # browser would otherwise obtain from its session cookies. The old
-    # /instance/<id>/f3mf shape is dead, which is why this platform looked like
-    # a hard login wall when it was really the wrong endpoint.
+    # The download the MakerWorld site itself performs for a signed-in user:
+    # GET the plate's instance with the account's bearer, and the JSON reply
+    # carries a signed CDN "url" valid for a few minutes. makerworld.com first,
+    # as the site calls it; the same path on api.bambulab.com second. The
+    # profile route last: it now reports the file's name and md5 but leaves
+    # "url" empty, which was the "returned no download URL" error.
+    INSTANCE_DOWNLOAD_URLS = (
+        "https://makerworld.com/api/v1/design-service/instance/%s/f3mf",
+        "https://api.bambulab.com/v1/design-service/instance/%s/f3mf",
+    )
     PROFILE_DOWNLOAD_URL = "https://api.bambulab.com/v1/iot-service/api/user/profile/%s"
 
     @staticmethod
@@ -1114,6 +1118,7 @@ class MakerWorldSearcher:
                 "name": (hit.get("title") or ("profile-%s" % profile_id)) + ".3mf",
                 "url": "",
                 "_profile_id": profile_id,
+                "_instance_id": hit.get("id") or "",
                 "_model_id": model_id,
             })
         return files
@@ -1126,19 +1131,36 @@ class MakerWorldSearcher:
         if not token:
             raise RuntimeError("MakerWorld needs your Bambu Cloud token.")
         headers = dict(MakerWorldSearcher._headers(), Authorization="Bearer " + token)
-        r = _http.get(
-            MakerWorldSearcher.PROFILE_DOWNLOAD_URL % entry["_profile_id"],
-            params={"model_id": entry.get("_model_id", "")},
-            headers=headers, timeout=30)
-        if r.status_code == 401:
-            raise RuntimeError("Bambu Cloud rejected the token. Sign in again and "
-                               "paste a fresh one into the plugin's config.")
-        r.raise_for_status()
-        link = (r.json() or {}).get("url")
-        if not link:
-            raise RuntimeError("MakerWorld returned no download URL for %s."
-                               % entry.get("name", "this profile"))
-        return link
+        name = entry.get("name", "this profile")
+
+        attempts = []
+        if entry.get("_instance_id"):
+            for url in MakerWorldSearcher.INSTANCE_DOWNLOAD_URLS:
+                attempts.append((url % entry["_instance_id"], {"type": "download"}))
+        attempts.append((MakerWorldSearcher.PROFILE_DOWNLOAD_URL % entry["_profile_id"],
+                         {"model_id": entry.get("_model_id", "")}))
+
+        reasons = []
+        for url, params in attempts:
+            r = _http.get(url, params=params, headers=headers, timeout=30)
+            host = urllib.parse.urlsplit(url).hostname
+            if r.status_code == 401:
+                raise RuntimeError("Bambu Cloud rejected your MakerWorld sign-in; it "
+                                   "has probably expired. Sign in again under Accounts.")
+            if r.status_code >= 400:
+                reasons.append("%s: %s" % (host, _api_error(r, "refused")))
+                continue
+            try:
+                body = r.json() or {}
+            except ValueError:
+                body = {}
+            link = body.get("url") if isinstance(body, dict) else ""
+            if link:
+                return link
+            reasons.append("%s: %s" % (host, _api_error(r, "no url in reply")))
+        # Every route's own words, so a changed reply can be diagnosed.
+        raise RuntimeError("MakerWorld returned no download URL for %s (%s)"
+                           % (name, "; ".join(reasons)))
 
 
 class SnapmakerSpaceSearcher:
@@ -1381,37 +1403,26 @@ _SEARCHERS = {
 # Keyed on the "platform" field of a result. Printables serves files to anyone;
 # MakerWorld serves them to an account. Nexprint (401) and Makeronline (403)
 # still have no route the plugin can take.
-# MakerWorld is search-only: with a valid Bambu token (user-service/my/profile
-# answers 200) the old iot-service profile route answers 400 "check specified
-# resource exist", and design-service/instance/<id>/f3mf?type=download answers
-# 403 "The client does not have access rights to the content" on both
-# api.bambulab.com and makerworld.com, bearer or cookie alike. Bambu serves
-# files only to its own clients, and posing as one is not on the table.
-# Checked 2026-11-20.
 _FILE_RESOLVERS = {
     "Printables": PrintablesSearcher.get_files,
+    "MakerWorld": MakerWorldSearcher.get_files,
     "Makeronline": MakeronlineSearcher.get_files,
     "Snapmaker Space": SnapmakerSpaceSearcher.get_files,
-}
-
-# Why a searchable platform cannot be imported, shown on its results.
-_NO_IMPORT_NOTES = {
-    "MakerWorld": "Bambu Lab only lets its own apps download MakerWorld files "
-                  "(the MakerWorld site, Bambu Studio, Bambu Handy). Download it "
-                  "there, then open the file in OrcaSlicer.",
 }
 
 # Platforms that serve files only to an account, and the config key holding the
 # user's own token for each. Without the token the platform stays searchable but
 # is not offered for import, so the guard rail holds: everything the panel says
 # it can import, it can import.
-_TOKEN_KEYS = {"Makeronline": "makeronline_token",
+_TOKEN_KEYS = {"MakerWorld": "makerworld_token",
+               "Makeronline": "makeronline_token",
                "Snapmaker Space": "snapmaker_token"}
 
 # Platforms whose file list carries no URL, because minting one costs an
 # authenticated call that expires in minutes. Called once per picked file, at
 # download time. A platform absent here has usable URLs already.
-_URL_MINTERS = {"Makeronline": MakeronlineSearcher.mint_url}
+_URL_MINTERS = {"MakerWorld": MakerWorldSearcher.mint_url,
+                "Makeronline": MakeronlineSearcher.mint_url}
 
 # Platforms that can be signed into from inside the plugin window:
 # (request a code, exchange it for a token). A None first element means the
@@ -1419,7 +1430,9 @@ _URL_MINTERS = {"Makeronline": MakeronlineSearcher.mint_url}
 # instead - Anycubic's SSO answers enableCodeSignin:false, and pretending
 # otherwise would leave the user waiting for a mail that never arrives.
 # A platform absent here can still be connected by pasting a token.
-_AUTH = {"Makeronline": (None, MakeronlineSearcher.sign_in),
+_AUTH = {"MakerWorld": (MakerWorldSearcher.send_code,
+                        MakerWorldSearcher.login_with_code),
+         "Makeronline": (None, MakeronlineSearcher.sign_in),
          "Snapmaker Space": (SnapmakerSpaceSearcher.send_code,
                              SnapmakerSpaceSearcher.login_with_code)}
 
@@ -1443,8 +1456,7 @@ def _accounts(tokens):
         else:
             state = "unavailable"   # nothing the plugin can fetch, with or without one
         rows.append({"platform": name, "state": state, "key": key or "",
-                     "help": _TOKEN_HELP.get(name, "") if key else "",
-                     "note": _NO_IMPORT_NOTES.get(name, ""),
+                     "help": _TOKEN_HELP.get(name, ""),
                      "can_sign_in": name in _AUTH,
                      "sign_in_mode": ("code" if (_AUTH.get(name) or (None,))[0]
                                       else "password") if name in _AUTH else ""})
@@ -1730,7 +1742,7 @@ PAGE = r"""<!DOCTYPE html>
 
   // Filled from the Accounts message, so the help text has one home (Python's
   // _TOKEN_HELP) instead of a copy here that can drift from it.
-  var TOKEN_HELP = {}, NO_IMPORT = {}, ACCOUNTS = [];
+  var TOKEN_HELP = {}, ACCOUNTS = [];
 
   function showAccounts() {
     var box = $("acct-rows"), html = "";
@@ -1767,7 +1779,7 @@ PAGE = r"""<!DOCTYPE html>
              +  '<button onclick="saveAcct(' + i + ')">Save</button></div>';
         if (a.can_sign_in) html += '</details>';
       } else if (a.state === "unavailable") {
-        html += '<p>' + esc(a.note || "Searchable, but it serves no file the plugin can fetch yet.") + '</p>';
+        html += '<p>Searchable, but it serves no file the plugin can fetch yet.</p>';
       } else {
         html += '<p>Files download without signing in to anything.</p>';
       }
@@ -1834,10 +1846,8 @@ PAGE = r"""<!DOCTYPE html>
     }
     // Only MakerWorld has a token route today; the others are gated because no
     // resolver exists for them at all, and a recipe would be a lie there.
-    gate.textContent = NO_IMPORT[model.platform]
-      ? NO_IMPORT[model.platform] + (model.url ? " Model page: " + model.url : "")
-      : model.platform + " serves files only to an account."
-        + (TOKEN_HELP[model.platform] || " The plugin cannot fetch its files yet.");
+    gate.textContent = model.platform + " serves files only to an account."
+      + (TOKEN_HELP[model.platform] || " The plugin cannot fetch its files yet.");
     gate.classList.add("active");
     // A disabled button under an instruction is a dead end: the user is told what
     // to do and given nothing to do it with. The field is the action.
@@ -2001,8 +2011,6 @@ PAGE = r"""<!DOCTYPE html>
       ACCOUNTS = msg.rows || [];
       TOKEN_HELP = {};
       ACCOUNTS.forEach(function (a) { if (a.help) TOKEN_HELP[a.platform] = " " + a.help; });
-      NO_IMPORT = {};
-      ACCOUNTS.forEach(function (a) { if (a.note) NO_IMPORT[a.platform] = a.note; });
       // First run: show the setup instead of letting the user meet the gate
       // later, on a model they already decided they wanted.
       if (msg.first_run) showAccounts();
@@ -2181,6 +2189,8 @@ if orca is not None:
         def _do_search(self, msg):
             query = msg.get("query", "")
             platforms = msg.get("platforms", [])
+            print("[search_engine] search %r on %s" % (query, platforms),
+                  file=sys.stderr, flush=True)
             tokens = self._tokens()
             results = []
             errors = []
@@ -2193,10 +2203,14 @@ if orca is not None:
                 # Searching covers every listed platform; only the import step
                 # needs a resolver, and for a gated platform also a token.
                 try:
+                    started = time.time()
                     found = adapter.search(query, tokens)
                     for r in found:
                         r["importable"] = _importable(r.get("platform", ""), tokens)
                     results.extend(found)
+                    print("[search_engine] %s: %d result(s) in %.1fs"
+                          % (platform, len(found), time.time() - started),
+                          file=sys.stderr, flush=True)
                 except Exception as e:
                     # Posting the error here used to be pointless: the results
                     # message below arrived straight after and overwrote the

@@ -2,8 +2,7 @@
 """A gated platform is importable exactly when the user's token is present.
 
 Covers the guard rail (nothing is offered for import that cannot be fetched)
-and the Makeronline sign-in, with no network and no `orca` host. MakerWorld is
-search-only: Bambu serves its files to Bambu's own apps alone.
+and the MakerWorld two-hop resolve, with no network and no `orca` host.
 """
 import json
 import os
@@ -42,14 +41,12 @@ import search_engine as script  # noqa: E402
 
 def test_importable_follows_the_token():
     assert script._importable("Printables", {}) is True, "Printables needs no token"
-    assert script._importable("Makeronline", {}) is False, "no token, not offered"
-    assert script._importable("Makeronline", {"makeronline_token": "   "}) is False, \
+    assert script._importable("MakerWorld", {}) is False, "no token, not offered"
+    assert script._importable("MakerWorld", {"makerworld_token": "   "}) is False, \
         "whitespace is not a token"
-    assert script._importable("Makeronline", {"makeronline_token": "abc"}) is True
-    assert script._importable("Nexprint", {"makeronline_token": "abc"}) is False, \
+    assert script._importable("MakerWorld", {"makerworld_token": "abc"}) is True
+    assert script._importable("Nexprint", {"makerworld_token": "abc"}) is False, \
         "a token for one platform must not unlock another"
-    assert script._importable("MakerWorld", {"makerworld_token": "abc"}) is False, \
-        "MakerWorld refuses third-party downloads, token or not"
 
 
 def test_makerworld_resolver_needs_a_token():
@@ -89,16 +86,29 @@ def test_listing_profiles_mints_nothing(calls):
     return files
 
 
-def test_minting_uses_the_alphanumeric_model_id(calls, files):
+def test_minting_uses_the_instance_download_the_site_uses(calls, files):
     del calls[:]
     url = script.MakerWorldSearcher.mint_url(files[0], {"makerworld_token": "TOK"})
 
     assert url == "https://cdn/a?key=1"
-    assert len(calls) == 1, "one call per picked file"
-    # The integer designId from the /models/<N> URL is rejected by this endpoint;
-    # it must be the alphanumeric modelId taken from the design.
-    assert calls[0]["params"] == {"model_id": "US2bb73b106683e5"}, calls[0]["params"]
+    assert len(calls) == 1, "the site's own route answers first"
+    assert calls[0]["url"].startswith("https://makerworld.com/"), calls[0]["url"]
+    assert calls[0]["params"] == {"type": "download"}, calls[0]["params"]
     assert calls[0]["headers"]["Authorization"] == "Bearer TOK"
+
+
+def test_a_refused_download_says_what_each_route_answered(calls, files):
+    del calls[:]
+    try:
+        script.MakerWorldSearcher.mint_url(files[1], {"makerworld_token": "TOK"})
+    except RuntimeError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("an empty url must not be returned as a link")
+    assert len(calls) == 3, [c["url"] for c in calls]
+    # The profile route takes the alphanumeric modelId, never the integer designId.
+    assert calls[2]["params"] == {"model_id": "US2bb73b106683e5"}, calls[2]["params"]
+    assert "no access" in msg and "api.bambulab.com" in msg, msg
 
 
 def test_saving_a_token_merges_and_never_echoes_it():
@@ -108,17 +118,17 @@ def test_saving_a_token_merges_and_never_echoes_it():
 
     posted = []
     cap._post = posted.append
-    cap._save_token({"platform": "Makeronline", "token": "  SECRET  "})
+    cap._save_token({"platform": "MakerWorld", "token": "  SECRET  "})
     # A successful save is followed by a refreshed Accounts list, so pick the
     # reply by its action rather than by position.
     saved = [m for m in posted if m["action"] == "token_saved"][-1]
 
     stored = json.loads(cap.get_config())
-    assert stored["makeronline_token"] == "SECRET", "the token is stored, trimmed"
+    assert stored["makerworld_token"] == "SECRET", "the token is stored, trimmed"
     assert stored["other_token"] == "keep-me", "a merge, not a replace"
-    assert saved["ok"] is True and saved["platform"] == "Makeronline"
+    assert saved["ok"] is True and saved["platform"] == "MakerWorld"
     assert "SECRET" not in json.dumps(posted), "no reply may carry the token back"
-    assert script._importable("Makeronline", stored) is True, "import is now offered"
+    assert script._importable("MakerWorld", stored) is True, "import is now offered"
 
     cap._save_token({"platform": "Nexprint", "token": "x"})
     assert posted[-1]["ok"] is False, "a platform with no token key is refused"
@@ -130,16 +140,13 @@ def test_accounts_rows_match_what_is_importable():
     rows = {r["platform"]: r for r in script._accounts({})}
 
     assert rows["Printables"]["state"] == "open", "no account needed"
-    assert rows["Makeronline"]["state"] == "needs_token"
-    assert rows["Makeronline"]["help"], "a gated platform must say how to connect"
-    assert rows["MakerWorld"]["state"] == "unavailable", "search-only"
-    assert rows["MakerWorld"]["note"], "a search-only platform must say why"
-    assert not rows["MakerWorld"]["help"], "and must not ask for a token that cannot help"
+    assert rows["MakerWorld"]["state"] == "needs_token"
+    assert rows["MakerWorld"]["help"], "a gated platform must say how to connect"
     assert rows["Nexprint"]["state"] == "unavailable", "no resolver, so no token helps"
     assert rows["GrabCAD"]["state"] == "unavailable"
 
-    connected = {r["platform"]: r for r in script._accounts({"makeronline_token": "T"})}
-    assert connected["Makeronline"]["state"] == "connected"
+    connected = {r["platform"]: r for r in script._accounts({"makerworld_token": "T"})}
+    assert connected["MakerWorld"]["state"] == "connected"
     # Every platform the panel can search has a row, or the screen hides one.
     assert set(rows) == {a.PLATFORM for a in script._SEARCHERS.values()}
 
@@ -181,7 +188,7 @@ def test_signing_in_asks_for_a_code_and_never_a_password():
         raise AssertionError("a login with no token must raise")
 
 
-def test_makerworld_cannot_be_signed_into():
+def test_a_completed_sign_in_stores_the_token():
     cap = script.SearchEngineScript()
     cap._stored = "{}"
     posted = []
@@ -189,8 +196,8 @@ def test_makerworld_cannot_be_signed_into():
     cap._do_auth("sign_in", {"platform": "MakerWorld",
                              "email": "someone@example.com", "code": "123456"})
 
-    assert json.loads(cap.get_config()) == {}, "a login that cannot help stores nothing"
-    assert posted[-1]["ok"] is False
+    assert json.loads(cap.get_config())["makerworld_token"] == "TOK"
+    assert [m for m in posted if m["action"] == "token_saved" and m["ok"]]
 
     cap._do_auth("sign_in", {"platform": "Printables"})
     assert posted[-1] == {"action": "auth", "ok": False, "platform": "Printables",
@@ -275,7 +282,7 @@ def test_makeronline_signs_in_with_a_password_and_keeps_only_the_token():
 
     rows = {r["platform"]: r for r in script._accounts({})}
     assert rows["Makeronline"]["sign_in_mode"] == "password"
-    assert rows["MakerWorld"]["sign_in_mode"] == ""
+    assert rows["MakerWorld"]["sign_in_mode"] == "code"
 
     url = script.MakeronlineSearcher.mint_url(
         {"_key": "b48e37341606360c43d2807eb07dc2f0", "_mold_id": "151818",
@@ -308,13 +315,17 @@ def _install_fake_requests():
         if url.endswith("/design/1400373"):
             return _Resp({"modelId": "US2bb73b106683e5"})
         if url.endswith("/instances"):
-            return _Resp({"hits": [{"profileId": 11, "title": "Plate A"},
-                                   {"profileId": 12, "title": "Plate B"},
+            return _Resp({"hits": [{"profileId": 11, "id": 501, "title": "Plate A"},
+                                   {"profileId": 12, "id": 502, "title": "Plate B"},
                                    {"title": "no profileId, skipped"}]})
+        if url == "https://makerworld.com/api/v1/design-service/instance/501/f3mf":
+            return _Resp({"url": "https://cdn/a?key=1"})
+        if "/instance/502/f3mf" in url:
+            return _Resp({"code": 3, "error": "no access"}, 403)
         if url.endswith("/profile/11"):
             return _Resp({"url": "https://cdn/a?key=1"})
         if url.endswith("/profile/12"):
-            return _Resp({"url": "https://cdn/b?key=2"})
+            return _Resp({"name": "b.3mf", "md5": "x", "url": ""})
         raise AssertionError("unexpected call: " + url)
 
     fake.get = get
@@ -328,10 +339,11 @@ if __name__ == "__main__":
     test_saving_a_token_merges_and_never_echoes_it()
     test_accounts_rows_match_what_is_importable()
     test_signing_in_asks_for_a_code_and_never_a_password()
-    test_makerworld_cannot_be_signed_into()
+    test_a_completed_sign_in_stores_the_token()
     test_makeronline_signs_in_with_a_password_and_keeps_only_the_token()
     test_makeronline_resolver_needs_a_token()
     calls = _install_fake_requests()
     files = test_listing_profiles_mints_nothing(calls)
-    test_minting_uses_the_alphanumeric_model_id(calls, files)
+    test_minting_uses_the_instance_download_the_site_uses(calls, files)
+    test_a_refused_download_says_what_each_route_answered(calls, files)
     print("token-gated import: ok")
